@@ -13,7 +13,8 @@ What it does
      discussion, and writes everything verbatim to export/papers/<number>/data.json
   4. Writes two static HTML viewers into each paper directory —
      metareview.html (the venue AC metareview page) and forum.html (the review
-     discussion) — plus export/index.html listing all papers.
+     discussion) — plus export/index.html listing all papers, sortable by
+     metareview status and AC score.
 
 The viewers are plain HTML/CSS/JS with no build step, no server and no network
 access at run time: open any of them straight from disk. Styling reuses
@@ -179,6 +180,32 @@ def get_assignments(api, venue, role="Area_Chairs"):
     return ids
 
 
+META_RE = re.compile(r"Meta_?Review", re.I)
+NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def invitations(note):
+    return note.get("invitations") or ([note["invitation"]] if note.get("invitation") else [])
+
+
+def find_metareview(notes):
+    """The metareview note itself.
+
+    Match the invitation tail rather than the whole path: issue reports filed
+    against a metareview live under .../Meta_Review1/-/Meta-Review_Issue_Report
+    and would otherwise win, carrying no overall assessment with them.
+    """
+    for n in notes:
+        if any(META_RE.fullmatch(i.split("/-/")[-1]) for i in invitations(n)):
+            return n
+    return None
+
+
+def first_num(s):
+    m = NUM_RE.search("" if s is None else str(s))
+    return float(m.group()) if m else None
+
+
 def load_submissions(api, venue, wanted_ids):
     """Map submission note id -> note, for the assigned ids."""
     wanted = set(wanted_ids)
@@ -306,13 +333,36 @@ def esc(s):
     )
 
 
+def index_row(data):
+    """The per-paper facts index.html lists and sorts on."""
+    return {
+        "number": data["number"],
+        "title": data["title"],
+        "venue_forum_url": data["venue_forum_url"],
+        "n_notes": len(data["forum_notes"]) or len(data["venue_notes"]),
+        "pdf_file": data.get("pdf_file"),
+        # Your own recommendation lives on the venue-side metareview; the AC
+        # score is the overall assessment on the review forum's metareview.
+        "recommendation_done": bool(
+            val(((find_metareview(data["venue_notes"]) or {}).get("content") or {}).get("recommendation"))
+        ),
+        "ac_score": first_num(
+            val(((find_metareview(data["forum_notes"]) or {}).get("content") or {}).get("overall_assessment"))
+        ),
+    }
+
+
 def index_html(papers, venue):
     rows = ""
     for p in papers:
         n = p["number"]
-        rows += f"""<li class="note">
+        done = p["recommendation_done"]
+        score = "" if p["ac_score"] is None else f"{p['ac_score']:g}"
+        rows += f"""<li class="note" data-number="{n}" data-done="{1 if done else 0}" data-score="{score}">
   <h4><a href="papers/{n}/metareview.html">#{n} &nbsp;{esc(p['title'])}</a></h4>
   <div class="note-meta-info">
+    <span class="pill {'done' if done else 'todo'}">recommendation {'done' if done else 'incomplete'}</span>
+    <span class="pill score">AC score {score or '&ndash;'}</span>
     <a href="papers/{n}/metareview.html">metareview</a> &nbsp;&middot;&nbsp;
     <a href="papers/{n}/forum.html">forum ({p['n_notes']} notes)</a> &nbsp;&middot;&nbsp;
     {f'<a href="papers/{n}/{p["pdf_file"]}">PDF</a> &nbsp;&middot;&nbsp;' if p.get("pdf_file") else ''}
@@ -320,6 +370,7 @@ def index_html(papers, venue):
     <a href="{p['venue_forum_url']}" target="_blank">OpenReview</a>
   </div>
 </li>"""
+    done_count = sum(1 for p in papers if p["recommendation_done"])
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -333,10 +384,20 @@ def index_html(papers, venue):
 <div class="container">
   <div class="page-head">
     <h1>{esc(venue)}</h1>
-    <div class="page-sub">{len(papers)} area-chair assignments</div>
+    <div class="page-sub">{len(papers)} area-chair assignments &nbsp;&middot;&nbsp;
+      {done_count} recommendations done, {len(papers) - done_count} to go</div>
+  </div>
+  <div class="controls">
+    <label>Sort by <select id="sort-key" onchange="sortIndex()">
+      <option value="number">submission number</option>
+      <option value="recommendation">recommendation done</option>
+      <option value="score">AC score</option>
+    </select></label>
+    <button id="sort-dir" onclick="toggleSortDir()">ascending &uarr;</button>
   </div>
   <ul class="submissions-list">{rows}</ul>
 </div>
+<script src="assets/viewer.js"></script>
 </body>
 </html>
 """
@@ -501,6 +562,12 @@ ul.submissions-list h4 { font-size: 1.0625rem; margin: 0 0 .15rem; font-weight: 
 ul.submissions-list a { color: #3e6775; text-decoration: none; }
 ul.submissions-list a:hover { text-decoration: underline; }
 .note-meta-info { font-size: .75rem; color: #616161; }
+.note-meta-info .pill { display: inline-block; font-size: .625rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .04em; padding: 1px 5px; border-radius: 2px;
+  margin-right: .4rem; }
+.note-meta-info .pill.done { background: #e7efe7; color: #3c603c; }
+.note-meta-info .pill.todo { background: #fdf3f2; color: #8c1b13; }
+.note-meta-info .pill.score { background: #eceff2; color: #2c3a4a; }
 """
 
 # Used only when OpenReview's stylesheets could not be downloaded. Mirrors the
@@ -1007,6 +1074,39 @@ function renderMetareview(data, root) {
     '</div>';
 }
 
+/* ── index page ───────────────────────────────────────────────────────────── */
+var indexAscending = true;
+
+function sortValue(li, key) {
+  if (key === 'recommendation') return Number(li.dataset.done);
+  if (key === 'score') return li.dataset.score === '' ? null : Number(li.dataset.score);
+  return Number(li.dataset.number);
+}
+
+function sortIndex() {
+  var key = document.getElementById('sort-key').value;
+  var dir = indexAscending ? 1 : -1;
+  var list = document.querySelector('ul.submissions-list');
+  var items = Array.prototype.slice.call(list.children);
+  items.sort(function (a, b) {
+    var av = sortValue(a, key), bv = sortValue(b, key);
+    if (av === null || bv === null) {                 // no AC score yet: rank last
+      if (av !== bv) return av === null ? 1 : -1;
+    } else if (av !== bv) {
+      return (av - bv) * dir;
+    }
+    return Number(a.dataset.number) - Number(b.dataset.number);
+  });
+  items.forEach(function (li) { list.appendChild(li); });
+}
+
+function toggleSortDir() {
+  indexAscending = !indexAscending;
+  document.getElementById('sort-dir').innerHTML =
+    indexAscending ? 'ascending ↑' : 'descending ↓';
+  sortIndex();
+}
+
 function topbar(data, active) {
   function link(href, label, name) {
     return '<a href="' + href + '" class="' + (active === name ? 'active' : '') + '">' + label + '</a>';
@@ -1101,15 +1201,7 @@ def main():
         else:
             print(f"  [{i}/{len(ordered)}] #{number} {val(sub.get('content', {}).get('title'))[:60]}")
             data = export_paper(api, args.venue, sub, args.out, want_pdf=not args.no_pdf)
-        index_rows.append(
-            {
-                "number": number,
-                "title": data["title"],
-                "venue_forum_url": data["venue_forum_url"],
-                "n_notes": len(data["forum_notes"]) or len(data["venue_notes"]),
-                "pdf_file": data.get("pdf_file"),
-            }
-        )
+        index_rows.append(index_row(data))
 
     with open(os.path.join(args.out, "index.html"), "w") as f:
         f.write(index_html(index_rows, args.venue))
