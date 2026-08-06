@@ -3,7 +3,6 @@
 Export your OpenReview area-chair assignments to a folder of static HTML you
 can read offline — for when the OpenReview web app is down but the API is fine.
 
-No LLM, no build step, no server.
 
 ## Setup
 
