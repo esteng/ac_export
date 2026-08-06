@@ -19,8 +19,10 @@ python openreview_ac_export.py                       # everything, into ./export
 python openreview_ac_export.py --limit 3             # try it on 3 papers
 python openreview_ac_export.py --only 502,746        # specific submissions
 python openreview_ac_export.py --skip-existing       # resume without refetching
-python openreview_ac_export.py --venue COLM/2026/Conference --role Senior_Area_Chairs
 ```
+
+Defaults to your Area Chair assignments for `EMNLP/2026/Conference`; `--venue`
+and `--role` override that.
 
 Then open `export/index.html`.
 
@@ -56,7 +58,7 @@ still in the file.
   source the AC console uses, with a fallback to role-group membership.
 - OpenReview rate limits hard; the client paces itself and backs off on 429.
   A 50-paper export takes a couple of minutes.
-- For a commitment venue like EMNLP, reviews live on the ARR forum named in the
-  submission's `paper_link` — both forums are fetched. Other venues work too,
-  though the score table expects ARR-style fields (`overall_assessment`,
-  `confidence`, `soundness`, `excitement`).
+- EMNLP is a commitment venue: reviews live on the ARR forum named in the
+  submission's `paper_link`, so both forums are fetched. The score table reads
+  the ARR review fields (`overall_assessment`, `confidence`, `soundness`,
+  `excitement`).
