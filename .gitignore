@@ -1,3 +1,4 @@
 .keys
 export/
 __pycache__/
+*.DS_Store

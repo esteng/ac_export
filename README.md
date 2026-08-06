@@ -43,6 +43,12 @@ export/
     forum.html        the review discussion thread
 ```
 
+**index.html** — every assignment, each tagged with whether your recommendation
+is filled in and the AC score (`overall_assessment`) from the review-forum
+metareview. Sort on either one, or on submission number, with the dropdown, and
+flip the order with the button next to it. Papers with no AC score yet stay at
+the bottom whichever way the list is sorted.
+
 **metareview.html** — your metareview (recommendation, confidence, comment to
 authors, message to PCs), the authors' response, a reviewer score table with
 issue reports flagged, and the review-forum metareview.
