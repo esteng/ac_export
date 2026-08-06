@@ -107,6 +107,26 @@ class OpenReview:
             raise RuntimeError(f"{path} -> {r.status_code}: {r.text[:300]}")
         raise RuntimeError(f"{path}: still rate limited after {attempt + 1} attempts")
 
+    def download(self, url, dest):
+        """Fetch a binary attachment (PDFs need the auth header too)."""
+        for attempt in range(4):
+            gap = time.time() - self._last
+            if gap < self.MIN_INTERVAL:
+                time.sleep(self.MIN_INTERVAL - gap)
+            self._last = time.time()
+            r = self.session.get(url, headers={"Authorization": "Bearer " + self.token}, timeout=120)
+            if r.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                return False
+            if not r.content.startswith(b"%PDF"):  # an HTML error page, not a paper
+                return False
+            with open(dest, "wb") as f:
+                f.write(r.content)
+            return True
+        return False
+
     def get_all(self, path, key, **params):
         """Paginated fetch — OpenReview caps a single response at 1000 items."""
         out, offset, limit = [], 0, 1000
@@ -172,7 +192,40 @@ def load_submissions(api, venue, wanted_ids):
 
 
 # ─── export ─────────────────────────────────────────────────────────────────────
-def export_paper(api, venue, submission, out_root):
+def pdf_source(notes):
+    """(url, note_id) for the first note carrying a PDF, or (None, None)."""
+    for n in notes:
+        path = val((n.get("content") or {}).get("pdf"))
+        if not path:
+            continue
+        if str(path).startswith("http"):
+            return path, n["id"]
+        if str(path).startswith("/"):
+            return OR_WEB + path, n["id"]
+        return f"{OR_WEB}/pdf?id={n['id']}", n["id"]
+    return None, None
+
+
+def fetch_pdf(api, pdir, forum_notes, venue_notes):
+    """Save the submission PDF next to the data so the export reads offline."""
+    url, note_id = pdf_source(forum_notes)
+    if not url:
+        url, note_id = pdf_source(venue_notes)
+    if not url:
+        return None, None
+    dest = os.path.join(pdir, "paper.pdf")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return "paper.pdf", url
+    if api.download(url, dest):
+        return "paper.pdf", url
+    # Some venues only serve the PDF through the note id.
+    if note_id and api.download(f"{OR_WEB}/pdf?id={note_id}", dest):
+        return "paper.pdf", f"{OR_WEB}/pdf?id={note_id}"
+    print("    (no PDF available)")
+    return None, url
+
+
+def export_paper(api, venue, submission, out_root, want_pdf=True):
     number = submission.get("number")
     title = val(submission.get("content", {}).get("title")) or submission["id"]
     venue_forum = submission["id"]
@@ -185,6 +238,13 @@ def export_paper(api, venue, submission, out_root):
     if arr_forum and arr_forum != venue_forum:
         forum_notes = api.get_all("notes", "notes", forum=arr_forum)
 
+    pdir = os.path.join(out_root, "papers", str(number))
+    os.makedirs(pdir, exist_ok=True)
+
+    pdf_file, pdf_url = (None, None)
+    if want_pdf:
+        pdf_file, pdf_url = fetch_pdf(api, pdir, forum_notes, venue_notes)
+
     data = {
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "venue": venue,
@@ -195,12 +255,17 @@ def export_paper(api, venue, submission, out_root):
         "paper_link": paper_link,
         "review_forum_id": arr_forum,
         "review_forum_url": f"{OR_WEB}/forum?id={arr_forum}" if arr_forum else None,
+        "pdf_file": pdf_file,
+        "pdf_source_url": pdf_url,
         "venue_notes": venue_notes,
         "forum_notes": forum_notes,
     }
 
-    pdir = os.path.join(out_root, "papers", str(number))
-    os.makedirs(pdir, exist_ok=True)
+    write_paper_files(data, pdir)
+    return data
+
+
+def write_paper_files(data, pdir):
     with open(os.path.join(pdir, "data.json"), "w") as f:
         json.dump(data, f, indent=1, ensure_ascii=False)
     # Browsers block fetch() on file:// URLs, so the viewers read this instead.
@@ -211,9 +276,7 @@ def export_paper(api, venue, submission, out_root):
 
     for name, fn in (("metareview.html", "renderMetareview"), ("forum.html", "renderForum")):
         with open(os.path.join(pdir, name), "w") as f:
-            f.write(page_html(title, fn, depth=2))
-
-    return data
+            f.write(page_html(data["title"], fn, depth=2))
 
 
 def page_html(title, render_fn, depth):
@@ -252,6 +315,7 @@ def index_html(papers, venue):
   <div class="note-meta-info">
     <a href="papers/{n}/metareview.html">metareview</a> &nbsp;&middot;&nbsp;
     <a href="papers/{n}/forum.html">forum ({p['n_notes']} notes)</a> &nbsp;&middot;&nbsp;
+    {f'<a href="papers/{n}/{p["pdf_file"]}">PDF</a> &nbsp;&middot;&nbsp;' if p.get("pdf_file") else ''}
     <a href="papers/{n}/data.json">data.json</a> &nbsp;&middot;&nbsp;
     <a href="{p['venue_forum_url']}" target="_blank">OpenReview</a>
   </div>
@@ -280,9 +344,13 @@ def index_html(papers, venue):
 
 # ─── assets ─────────────────────────────────────────────────────────────────────
 CSS_LINK_RE = re.compile(r'<link[^>]+rel="stylesheet"[^>]+href="([^"]+\.css)"')
+# Font urls may carry a ?query or #fragment (the old IE/SVG glyphicon fallbacks).
+CSS_FONT_RE = re.compile(
+    r"url\((/_next/static/media/[^)\"'?#]+\.(?:woff2?|ttf|eot|svg))([^)\"']*)\)"
+)
 
 
-def fetch_openreview_css():
+def fetch_openreview_css(adir):
     """Concatenate OpenReview's own stylesheets. Returns None if unavailable."""
     try:
         home = requests.get(OR_WEB, timeout=20)
@@ -296,16 +364,44 @@ def fetch_openreview_css():
             r = requests.get(url, timeout=20)
             if r.status_code == 200:
                 chunks.append(f"/* {url} */\n{r.text}")
-        return "\n".join(chunks) if chunks else None
+        if not chunks:
+            return None
+        css = "\n".join(chunks)
     except requests.RequestException:
         return None
+
+    # Pull the webfonts local too, otherwise the pages fall back to system
+    # fonts once you are offline.
+    fonts = sorted({m[0] for m in CSS_FONT_RE.findall(css)})
+    if fonts:
+        mdir = os.path.join(adir, "media")
+        os.makedirs(mdir, exist_ok=True)
+        got = 0
+        for path in fonts:
+            name = os.path.basename(path)
+            dest = os.path.join(mdir, name)
+            if not os.path.exists(dest):
+                try:
+                    r = requests.get(OR_WEB + path, timeout=30)
+                    if r.status_code != 200:
+                        continue
+                    with open(dest, "wb") as f:
+                        f.write(r.content)
+                except requests.RequestException:
+                    continue
+            got += 1
+        css = CSS_FONT_RE.sub(
+            lambda m: f"url(media/{os.path.basename(m.group(1))}{m.group(2)})", css
+        )
+        print(f"  fetched {got}/{len(fonts)} webfonts")
+    return css
 
 
 def write_assets(out_root, use_remote_css=True):
     adir = os.path.join(out_root, "assets")
     os.makedirs(adir, exist_ok=True)
 
-    css = fetch_openreview_css() if use_remote_css else None
+    css = fetch_openreview_css(adir) if use_remote_css else None
     if css:
         print(f"  fetched OpenReview stylesheets ({len(css) // 1024} KB)")
     else:
@@ -357,6 +453,11 @@ table.scores td { border-top: 1px solid #eee; padding: .4rem .5rem; vertical-ali
 table.scores tr.flagged td { background: #fdf3f2; }
 table.scores td.num { font-weight: 700; text-align: center; width: 5.5rem; }
 table.scores a { color: #3e6775; }
+
+.forum-content-link .pdf-btn { display: inline-block; font-size: .6875rem; font-weight: 700;
+  letter-spacing: .04em; color: #fff; background: #8c1b13; border-radius: 2px;
+  padding: .15rem .45rem; text-decoration: none; vertical-align: .35rem; }
+.forum-content-link .pdf-btn:hover { background: #6e150f; text-decoration: none; }
 
 .issue-tag { background: #8c1b13; color: #fff; font-size: .625rem; font-weight: 700;
   text-transform: uppercase; padding: 1px 5px; border-radius: 2px; margin-left: .4rem;
@@ -646,6 +747,17 @@ function contentList(note, opts) {
   return '<ul class="note-content">' + items.join('') + '</ul>';
 }
 
+/* The PDF is saved next to data.json, so this keeps working offline.
+   style 'button' for the forum header, 'inline' for a meta line. */
+function pdfLink(data, style) {
+  if (!data.pdf_file) return '';
+  if (style === 'button') {
+    return '<span class="forum-content-link">' +
+      '<a class="pdf-btn" href="' + esc(data.pdf_file) + '" target="_blank">PDF</a></span>';
+  }
+  return '<a href="' + esc(data.pdf_file) + '" target="_blank">PDF</a>';
+}
+
 function submissionContent(note) {
   var primary = contentList(note, { only: PRIMARY_SUBMISSION_FIELDS });
   var rest = contentList(note, { exclude: PRIMARY_SUBMISSION_FIELDS });
@@ -753,7 +865,8 @@ function renderForum(data, root) {
   root.innerHTML = topbar(data, 'forum') +
     '<main class="forum"><div class="container">' +
       '<div class="forum-note">' +
-        '<div class="forum-title"><h2>' + esc(data.title) + '</h2></div>' +
+        '<div class="forum-title"><h2>' + esc(data.title) + '</h2>' +
+          pdfLink(data, 'button') + '</div>' +
         '<div class="forum-authors"><h3>' +
           esc(val(c.authors) || 'Authors anonymous') + '</h3></div>' +
         '<div class="forum-meta">' + meta.map(function (m) {
@@ -856,6 +969,7 @@ function renderMetareview(data, root) {
   var sub = [];
   if (data.number) sub.push('Submission ' + data.number);
   if (val(c.track)) sub.push(esc(val(c.track)));
+  if (data.pdf_file) sub.push(pdfLink(data, 'inline'));
   sub.push('<a href="' + esc(data.venue_forum_url) + '" target="_blank">venue forum</a>');
   if (data.review_forum_url) {
     sub.push('<a href="' + esc(data.review_forum_url) + '" target="_blank">review forum</a>');
@@ -902,6 +1016,7 @@ function topbar(data, active) {
       (data.number ? ' &middot; #' + data.number : '') + '</span>' +
     link('metareview.html', 'Metareview', 'metareview') +
     link('forum.html', 'Forum', 'forum') +
+    (data.pdf_file ? link(esc(data.pdf_file), 'PDF', 'pdf') : '') +
     link('data.json', 'data.json', 'data') +
     link('../../index.html', 'All papers', 'index') +
   '</div></div>';
@@ -922,6 +1037,7 @@ def main():
     p.add_argument("--only", help="comma-separated submission numbers to export")
     p.add_argument("--limit", type=int, help="export at most N papers (for testing)")
     p.add_argument("--skip-existing", action="store_true", help="skip papers that already have data.json")
+    p.add_argument("--no-pdf", action="store_true", help="do not download paper PDFs")
     p.add_argument("--no-css", action="store_true", help="do not download OpenReview's stylesheets")
     args = p.parse_args()
 
@@ -970,16 +1086,28 @@ def main():
         pdir = os.path.join(args.out, "papers", str(number))
         if args.skip_existing and os.path.exists(os.path.join(pdir, "data.json")):
             data = json.load(open(os.path.join(pdir, "data.json")))
-            print(f"  [{i}/{len(ordered)}] #{number} (cached)")
+            # A cached paper from before --no-pdf, or from an interrupted run,
+            # can still be missing its PDF — fill that in without refetching notes.
+            if not args.no_pdf and not data.get("pdf_file"):
+                pdf_file, pdf_url = fetch_pdf(api, pdir, data["forum_notes"], data["venue_notes"])
+                if pdf_file:
+                    data["pdf_file"], data["pdf_source_url"] = pdf_file, pdf_url
+                    write_paper_files(data, pdir)
+                    print(f"  [{i}/{len(ordered)}] #{number} (cached, + PDF)")
+                else:
+                    print(f"  [{i}/{len(ordered)}] #{number} (cached, no PDF)")
+            else:
+                print(f"  [{i}/{len(ordered)}] #{number} (cached)")
         else:
             print(f"  [{i}/{len(ordered)}] #{number} {val(sub.get('content', {}).get('title'))[:60]}")
-            data = export_paper(api, args.venue, sub, args.out)
+            data = export_paper(api, args.venue, sub, args.out, want_pdf=not args.no_pdf)
         index_rows.append(
             {
                 "number": number,
                 "title": data["title"],
                 "venue_forum_url": data["venue_forum_url"],
                 "n_notes": len(data["forum_notes"]) or len(data["venue_notes"]),
+                "pdf_file": data.get("pdf_file"),
             }
         )
 
